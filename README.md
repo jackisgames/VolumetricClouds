@@ -5,7 +5,7 @@ Simple volumetric clouds implementation in unity
 
 Inspired by cloud implementation in Horizon zero dawn.
 
-http://advances.realtimerendering.com/s2015/The%20Real-time%20Volumetric%20Cloudscapes%20of%20Horizon%20-%20Zero%20Dawn%20-%20ARTR.pdf  
+http://advances.realtimerendering.com/s2015/The%20Real-time%20Volumetric%20Cloudscapes%20of%20Horizon%20-%20Zero%20Dawn%20-%20ARTR.pdf
 
 includes
 - 3D warley perlin noise generator
