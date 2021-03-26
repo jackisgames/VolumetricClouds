@@ -1,0 +1,258 @@
+﻿#pragma kernel CloudRaymarch
+#include "UnityCG.cginc"
+
+struct LocalCloudData
+{
+	float3 Position;
+	float3 Extents;
+	float TextureScale;
+	float DensityThreshold;
+	float DensityMultiplier;
+	float EdgeFadeDistance;
+};
+
+//---------------------------------
+//Built-in data
+Texture2D<half> _CameraDepthTexture;
+fixed4 _LightColor0;
+//---------------------------------
+Texture3D<half4> CloudTexture;
+SamplerState samplerCloudTexture;
+
+Texture3D<half4> CloudDetailTexture;
+SamplerState samplerCloudDetailTexture;
+
+Texture2D<float> CloudFormationMapTexture;
+SamplerState samplerCloudFormationMapTexture;
+
+Texture2D<half3> RandomNoiseTexture;
+SamplerState samplerRandomNoiseTexture;
+
+Texture2D<half> BlueNoiseTexture;
+SamplerState samplerBlueNoiseTexture;
+
+Texture2D<half4> Source;
+RWTexture2D<half4> Target;
+half4x4 CameraToWorldMatrix;
+half4x4 CameraInvProjectionMatrix;
+StructuredBuffer<LocalCloudData> LocalClouds;
+int NumLocalClouds;
+int MaxRaySteps;
+
+float3 CloudScale;
+float DensityThreshold;
+float DensityMultiplier;
+float GlobalCloudHeight;
+float GlobalCloudSize;
+
+struct Ray {
+    half3 Origin;
+    half3 Direction;
+};
+
+Ray CreateRay(float2 uv) {
+	Ray ray;
+    ray.Origin = mul(CameraToWorldMatrix, float4(0,0,0,1)).xyz;
+    ray.Direction = mul(CameraInvProjectionMatrix, float4(uv ,0, 1)).xyz;
+    ray.Direction = mul(CameraToWorldMatrix, float4(ray.Direction,0)).xyz;
+    ray.Direction = normalize(ray.Direction); //todo: probably already normalized?
+
+	return ray;
+}
+
+float2 RayInfBoxDistance( Ray ray, float planeY, float planeSize )
+{
+	float3 upperPlane = float3( ray.Origin.x, planeY + planeSize, ray.Origin.z );
+	float3 lowerPlane = float3( ray.Origin.x, planeY - planeSize, ray.Origin.z );
+	float3 normal = normalize( float3( 0, ray.Origin.y - planeY, 0 ) );
+	float rayNormal = dot( normal, ray.Direction ) + .00001f;
+	float distA = max( dot( upperPlane - ray.Origin - ray.Direction, normal) / rayNormal , 0 );// , 100);
+	float distB = max( dot( lowerPlane - ray.Origin - ray.Direction, normal) / rayNormal , 0 );//, 100);
+
+	return float2( min( distA, distB ) , max(distA, distB ));
+}
+
+half2 SlabTest(float3 boundsMin, float3 boundsMax, float3 rayOrigin, float3 raydir) {
+	// Efficient slab test for ray intersection adapted from: http://jcgt.org/published/0007/03/04/
+	half3 rayDirInv = 1.0 / raydir;
+	half3 t0 = (boundsMin - rayOrigin) * rayDirInv;
+	half3 t1 = (boundsMax - rayOrigin) * rayDirInv;
+	half3 tmin = min(t0, t1);
+	half3 tmax = max(t0, t1);
+	
+	half dstA = max(max(tmin.x, tmin.y), tmin.z);
+	half dstB = min(tmax.x, min(tmax.y, tmax.z));
+	
+	return half2( max(0, dstA),  max(0, dstB));
+}
+
+half CalcCloudTexture( float4 c, float4 d )
+{
+	//return clamp( c.x + c.z * c.w + c.y * (d.x - d.y + d.z * d.w) *.01, 0 , 1);
+	//return c.x + c.y * .5 + c.z *.02 + c.w * .001;// + d.x;
+	return dot(c, d);
+}
+
+half SampleLocalCloudsDensity( Ray ray, uint2 screenPos )
+{
+	half depth = LinearEyeDepth(_CameraDepthTexture[screenPos]);
+
+	half cloudDensity = 0;
+
+	for( int i = 0 ; i < NumLocalClouds; ++i )
+	{
+		LocalCloudData cloudData = LocalClouds[i];
+
+		half3 boundsMin = cloudData.Position - cloudData.Extents;
+		half3 boundsMax = cloudData.Position + cloudData.Extents;
+
+		half2 rayToBoxDst = SlabTest( boundsMin , boundsMax , ray.Origin, ray.Direction );
+
+		half distanceLimit = min( depth, rayToBoxDst.y );
+
+		half dist = rayToBoxDst.x + BlueNoiseTexture.SampleLevel(samplerBlueNoiseTexture, screenPos*.02 , 1);
+		
+		half3 randomRayOffset = RandomNoiseTexture.SampleLevel( samplerRandomNoiseTexture ,( screenPos * .05 + _Time.x*.01 ), 1 );
+		
+		half rayTravelDistance = distance(boundsMin, boundsMax) / (MaxRaySteps * 2);
+		half rayStepsLeft = MaxRaySteps;
+		while( rayStepsLeft > 0 && dist < distanceLimit )
+		{
+			half3 rayPos = ray.Origin + randomRayOffset *.1 + ray.Direction * dist;
+
+			half mainCloud = CloudTexture.SampleLevel( samplerCloudTexture, ( cloudData.Position + rayPos ) * cloudData.TextureScale + _Time.x * .01 , 1 );
+			half detailCloud = CloudDetailTexture.SampleLevel( samplerCloudDetailTexture, rayPos * CloudScale + _Time.x * .001 , 1 );
+
+			half fadeDistance = cloudData.EdgeFadeDistance + .0001 + detailCloud;
+            half dstFromEdgeX = min(fadeDistance, min(rayPos.x - boundsMin.x, boundsMax.x - rayPos.x));
+            half dstFromEdgeY = min(fadeDistance, min(rayPos.y - boundsMin.y, boundsMax.y - rayPos.y));
+            half dstFromEdgeZ = min(fadeDistance, min(rayPos.z - boundsMin.z, boundsMax.z - rayPos.z));
+
+			half falloff = min(dstFromEdgeY, min(dstFromEdgeZ,dstFromEdgeX))/fadeDistance;
+
+			half sampledCloudDensity = max( CalcCloudTexture(mainCloud, detailCloud) - cloudData.DensityThreshold, 0) * cloudData.DensityMultiplier;
+
+			cloudDensity += sampledCloudDensity * rayTravelDistance * falloff;;
+
+			dist += rayTravelDistance;
+			rayStepsLeft--;
+		}
+	}
+	return 1 - clamp( exp( -cloudDensity ), 0 , 1);
+}
+
+half GlobalCloudLightMarch( half3 viewRayDir, half3 pos )
+{
+	half3 lightDirection = _WorldSpaceLightPos0;
+	
+	half deltaLight = length( _WorldSpaceLightPos0 - viewRayDir );
+	half penetrationTowardSun = 1 - smoothstep( 0, .82, length(deltaLight) );
+
+	penetrationTowardSun =  (penetrationTowardSun * penetrationTowardSun) * 1.25;
+
+	Ray ray;
+	ray.Origin = pos;
+	ray.Direction = _WorldSpaceLightPos0;
+
+	half2 rayToCloudDistance = RayInfBoxDistance( ray, GlobalCloudHeight, GlobalCloudSize );
+	
+	half rayStepsLeft = 5;//MaxRaySteps;
+
+	half stepSize = (rayToCloudDistance.y- rayToCloudDistance.x) / MaxRaySteps;
+
+	half totalDensity = 0;
+
+	while( rayStepsLeft > 0 )
+	{
+		pos += lightDirection * stepSize;
+
+		half cloudDensity =  CalcCloudTexture( CloudTexture.SampleLevel( samplerCloudTexture, pos * CloudScale + _Time.x * .001 , 1 ), CloudDetailTexture.SampleLevel( samplerCloudDetailTexture, pos * CloudScale, 1 ) );
+
+		totalDensity += cloudDensity;
+
+		rayStepsLeft--;
+	}
+	half lightAbsorptionTowardSun = 1;//todo expose this
+	half darknessThreshold = .7;//todo expose this
+	half transmittance = exp(-totalDensity * lightAbsorptionTowardSun );
+
+	return darknessThreshold + transmittance * ( 1 - darknessThreshold ) - penetrationTowardSun;
+}
+
+half2 SampleGlobalCloudsDensity( Ray ray, uint2 screenPos )
+{
+	half2 rayToCloudDistance = RayInfBoxDistance( ray, GlobalCloudHeight, GlobalCloudSize );
+	half cloudPenetration = 0;
+
+	//solution for ray banding
+	//http://www.alexandre-pestana.com/volumetric-lights/
+	
+	half3 randomRayOffset = RandomNoiseTexture.SampleLevel( samplerRandomNoiseTexture ,( screenPos *.01f + _Time.x*.01 ), 1 );
+
+	
+
+	half depth = LinearEyeDepth(_CameraDepthTexture[screenPos]);
+	half distanceLimit = min( depth, rayToCloudDistance.y);
+
+	
+	//to reduce banding when camera angle is too steep
+	half rayTravelDistance =  21 - abs( dot( ray.Direction, half3(0, 1, 0))) * 18;
+
+	half dist = rayToCloudDistance.x + BlueNoiseTexture.SampleLevel(samplerBlueNoiseTexture, screenPos*.02 , 1) * rayTravelDistance * .3;
+
+	half rayStepsLeft = MaxRaySteps;
+
+	half globalTransmittance = 1;
+
+	while(	rayStepsLeft > 0 && dist < distanceLimit ) 
+	{
+		
+		half3 rayPos = (ray.Origin + randomRayOffset) + ray.Direction * dist;//;
+
+		half cloudDensity = CalcCloudTexture( CloudTexture.SampleLevel( samplerCloudTexture, rayPos * CloudScale + _Time.x * .001 , 1 ), CloudDetailTexture.SampleLevel( samplerCloudDetailTexture, rayPos * CloudScale, 1 ) );
+
+		half cloudFormation = CloudFormationMapTexture.SampleLevel( samplerCloudFormationMapTexture, rayPos.xz * .001 + _Time.x * .01 , 1 );
+
+		const half globalFallOffSize = GlobalCloudSize * cloudDensity;
+		half globalFalloff = min( min(GlobalCloudHeight + GlobalCloudSize - rayPos.y, rayPos.y - (GlobalCloudHeight - GlobalCloudSize)), globalFallOffSize) /globalFallOffSize  ;////min( globalFallOffStartDistance - distance , globalFallOffDistance ) / globalFallOffDistance;
+		
+		//nicer falloff via polynomial calculation but if you need performance use this
+		//half densityBump = max( ( distance( ray.Origin, rayPos))/8000 ,  0);
+		half distanceNormalized = min( distance( ray.Origin, rayPos) / 8000, 1);
+		half densityBump = 1 -  pow( distanceNormalized, .8 ) * 2.2  + pow( distanceNormalized, 3.4 ) * 1.4 + distanceNormalized * 1.47 + pow( distanceNormalized, 13) * -1.2;
+
+		half globalCloudDensity = max( 0,  cloudDensity - DensityThreshold) * (DensityMultiplier + densityBump * DensityMultiplier  ) * cloudFormation;// * cloudFormation);
+
+		half cloudDensityFinal = globalCloudDensity * rayTravelDistance * globalFalloff;
+
+		if( cloudDensityFinal > 0 )
+		{
+			float transmittance = GlobalCloudLightMarch( ray.Direction, rayPos );
+			globalTransmittance *= exp(-cloudDensityFinal * transmittance );
+		}
+
+		cloudPenetration += cloudDensityFinal;
+
+		dist = dist + rayTravelDistance;
+		rayStepsLeft--;
+
+	}
+
+	return half2( 1 - clamp( exp( -( cloudPenetration ) ), 0 , 1), globalTransmittance);
+}
+
+[numthreads(8,8,1)]
+void CloudRaymarch (uint3 id : SV_DispatchThreadID)
+{
+	half width, height;
+	Source.GetDimensions( width, height );
+
+	half2 uv = id.xy / half2( width, height) * 2.0 - 1.0;
+	
+	Ray ray = CreateRay(uv);
+
+	half2 globalCloudDensity = SampleGlobalCloudsDensity( ray, id.xy );
+	half localCloudDensity = SampleLocalCloudsDensity( ray , id.xy );
+	
+	Target[id.xy] = lerp( Source[id.xy] , lerp( 1, _LightColor0, globalCloudDensity.y) , min(globalCloudDensity.x + localCloudDensity, 1) );
+}

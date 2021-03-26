@@ -1,0 +1,42 @@
+﻿#pragma kernel CSGenerateTexture
+#pragma kernel CSNormalizeTexture
+
+RWTexture2D<float4> NoiseTexture;
+StructuredBuffer<int3> Points;
+RWStructuredBuffer<uint> MinMax;
+int NumPoints;
+int Slice;
+int Dimension;
+float4 ColorChannelMask;
+
+[numthreads(8,8,1)]
+void CSGenerateTexture (uint3 id : SV_DispatchThreadID)
+{
+    uint val = Dimension;
+	
+	for( int i = 0; i < NumPoints; ++i )
+	{
+		int3 p1 = Points[i];
+		int3 p2 = int3( id.xy, Slice );
+		float  d = distance( p1 , p2 );
+
+		val = min( val, d );
+
+		//debug
+		/*if( id.x == p.x || id.y == p.y || d < 3 )
+		{
+			val = 1;
+		}*/
+	}
+
+	InterlockedMin( MinMax[0] , val );
+    InterlockedMax( MinMax[1] , val );
+
+    NoiseTexture[id.xy] = ( NoiseTexture[id.xy] * (1 - ColorChannelMask) ) + ColorChannelMask * val / Dimension;
+}
+
+[numthreads(8,8,1)]
+void CSNormalizeTexture (uint3 id : SV_DispatchThreadID)
+{
+    NoiseTexture[id.xy] = ( NoiseTexture[id.xy] * (1 - ColorChannelMask) ) + ColorChannelMask * ( 1.0 - NoiseTexture[id.xy] * Dimension / MinMax[1] );
+}
